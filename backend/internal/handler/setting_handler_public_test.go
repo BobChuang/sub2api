@@ -155,3 +155,25 @@ func TestSettingHandler_GetPublicSettings_ExposesWeChatOAuthModeCapabilities(t *
 	require.True(t, resp.Data.WeChatOAuthOpenEnabled)
 	require.True(t, resp.Data.WeChatOAuthMPEnabled)
 }
+
+func TestSettingHandler_GetPublicSettings_SimplifiedKeyCreation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, stored := range []string{"", "false", "true"} {
+		t.Run(stored, func(t *testing.T) {
+			repo := &settingHandlerPublicRepoStub{values: map[string]string{
+				service.SettingKeySimplifiedKeyCreationEnabled: stored,
+			}}
+			h := NewSettingHandler(service.NewSettingService(repo, &config.Config{}), "test-version")
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodGet, "/api/v1/settings/public", nil)
+			h.GetPublicSettings(c)
+			require.Equal(t, http.StatusOK, rec.Code)
+			var payload struct {
+				Data map[string]any `json:"data"`
+			}
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+			require.Equal(t, stored == "true", payload.Data["simplified_key_creation_enabled"])
+		})
+	}
+}

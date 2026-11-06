@@ -113,6 +113,7 @@ export default {
     importToCcSwitch: 'Import to CCS',
     enable: 'Enable',
     disable: 'Disable',
+    advancedSettings: 'Advanced settings',
     nameLabel: 'Name',
     namePlaceholder: 'My API Key',
     groupLabel: 'Group',

@@ -91,6 +91,22 @@ export function useOnboardingTour(options: OnboardingOptions) {
     return false
   }
 
+  // The simplified key form omits group selection when its only group is automatic.
+  // Skip that step in both directions, including keyboard and automatic navigation.
+  const moveTour = (direction: 1 | -1) => {
+    if (!driverInstance) return
+    const index = driverInstance.getActiveIndex() ?? 0
+    const next = driverInstance.getConfig().steps?.[index + direction]
+    if (next?.element === '[data-tour="key-form-group"]' &&
+        document.querySelector('#key-form[data-auto-selected-group]')) {
+      driverInstance.moveTo(index + direction * 2)
+    } else if (direction === 1) {
+      driverInstance.moveNext()
+    } else {
+      driverInstance.movePrevious()
+    }
+  }
+
   const startTour = async (startIndex = 0) => {
     // 动态获取当前用户角色和步骤
     const isAdmin = userStore.user?.role === 'admin'
@@ -147,11 +163,11 @@ export function useOnboardingTour(options: OnboardingOptions) {
               }
             }
           }
-          driverInstance?.moveNext()
+          moveTour(1)
         }
       },
       onPrevClick: () => {
-        driverInstance?.movePrevious()
+        moveTour(-1)
       },
       onCloseClick: () => {
         markAsSeen()
@@ -351,7 +367,7 @@ export function useOnboardingTour(options: OnboardingOptions) {
 
             // Final check before moving
             if (driverInstance && driverInstance.isActive()) {
-              driverInstance.moveNext()
+              moveTour(1)
             }
           }
 
@@ -453,7 +469,7 @@ export function useOnboardingTour(options: OnboardingOptions) {
         }
 
         // 非交互式步骤才允许箭头键翻页
-        driverInstance!.moveNext()
+        moveTour(1)
       }
       else if (e.key === 'Enter') {
         const target = e.target as HTMLElement
@@ -482,7 +498,7 @@ export function useOnboardingTour(options: OnboardingOptions) {
             }
           }
         }
-        driverInstance!.moveNext()
+        moveTour(1)
       }
       else if (e.key === 'ArrowLeft') {
         const target = e.target as HTMLElement
@@ -493,7 +509,7 @@ export function useOnboardingTour(options: OnboardingOptions) {
 
         e.preventDefault()
         e.stopPropagation()
-        driverInstance.movePrevious()
+        moveTour(-1)
       }
     }
 
@@ -506,7 +522,7 @@ export function useOnboardingTour(options: OnboardingOptions) {
     if (delay > 0) {
       await new Promise(resolve => setTimeout(resolve, delay))
     }
-    driverInstance.moveNext()
+    moveTour(1)
   }
 
   const isCurrentStep = (elementSelector: string): boolean => {

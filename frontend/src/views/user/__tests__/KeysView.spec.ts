@@ -583,6 +583,86 @@ describe('user KeysView column settings', () => {
       getAvailableGroups.mockResolvedValue(availableGroups)
     })
 
+    it.each([{}, { simplified_key_creation_enabled: false }])('keeps the original creation form when simplification is off: %j', async (settings) => {
+      getPublicSettings.mockResolvedValue(settings)
+      const wrapper = await openCreate()
+      expect(wrapper.findAll('input[name="key-provider"]')).toHaveLength(4)
+      expect(wrapper.get<HTMLInputElement>('[data-tour="key-form-name"]').element.value).toBe('')
+      expect(wrapper.find('[data-testid="key-advanced-toggle"]').exists()).toBe(false)
+      expect(wrapper.find('#key-form-advanced').exists()).toBe(true)
+    })
+
+    it('simplifies creation across all providers and preserves advanced values when collapsed', async () => {
+      getPublicSettings.mockResolvedValue({ simplified_key_creation_enabled: true })
+      const wrapper = await openCreate()
+      expect(wrapper.find('[data-tour="key-form-provider"]').exists()).toBe(false)
+      expect(optionIds(wrapper)).toEqual(availableGroups.map((group) => group.id))
+      expect(wrapper.get<HTMLInputElement>('[data-tour="key-form-name"]').element.value).toBe('keys.namePlaceholder')
+      expect(groupSelect(wrapper).props('modelValue')).toBeNull()
+      expect(wrapper.find('#key-form-advanced').exists()).toBe(false)
+
+      await wrapper.get('[data-testid="key-advanced-toggle"]').trigger('click')
+      expect(wrapper.get('[data-testid="key-advanced-toggle"]').attributes('aria-expanded')).toBe('true')
+      await wrapper.get('#key-form-advanced input[type="number"]').setValue(12)
+      await wrapper.get('[data-testid="key-advanced-toggle"]').trigger('click')
+      expect(wrapper.find('#key-form-advanced').exists()).toBe(false)
+      await groupSelect(wrapper).vm.$emit('update:modelValue', 5)
+      vi.mocked(keysAPI.create).mockResolvedValue({ ...createApiKey(), group_id: 5 })
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(vi.mocked(keysAPI.create).mock.calls[0]).toEqual([
+        'keys.namePlaceholder', 5, undefined, [], [], 12, undefined,
+        { rate_limit_5h: 0, rate_limit_1d: 0, rate_limit_7d: 0 },
+      ])
+    })
+
+    it('auto-selects the only available group and creates with safe default options', async () => {
+      getPublicSettings.mockResolvedValue({ simplified_key_creation_enabled: true })
+      getAvailableGroups.mockResolvedValue([availableGroups[4]])
+      const wrapper = await openCreate()
+      expect(wrapper.find('[data-tour="key-form-group"]').exists()).toBe(false)
+      await wrapper.get('#key-form').trigger('submit')
+      await flushPromises()
+      expect(vi.mocked(keysAPI.create).mock.calls[0]).toEqual([
+        'keys.namePlaceholder', 5, undefined, [], [], 0, undefined,
+        { rate_limit_5h: 0, rate_limit_1d: 0, rate_limit_7d: 0 },
+      ])
+    })
+
+    it('handles groups arriving after opening and resets advanced settings on reopening', async () => {
+      getPublicSettings.mockResolvedValue({ simplified_key_creation_enabled: true })
+      let resolveGroups!: (value: typeof availableGroups) => void
+      getAvailableGroups.mockReturnValue(new Promise((resolve) => { resolveGroups = resolve }))
+      const wrapper = await openCreate()
+      expect(wrapper.get<HTMLButtonElement>('[data-tour="key-form-submit"]').element.disabled).toBe(true)
+      await wrapper.get('#key-form').trigger('submit')
+      expect(keysAPI.create).not.toHaveBeenCalled()
+      expect(showError).toHaveBeenCalledWith('keys.groupRequired')
+      resolveGroups([availableGroups[1]])
+      await flushPromises()
+      expect(wrapper.find('[data-tour="key-form-group"]').exists()).toBe(false)
+      expect(wrapper.get<HTMLButtonElement>('[data-tour="key-form-submit"]').element.disabled).toBe(false)
+      await wrapper.get('[data-testid="key-advanced-toggle"]').trigger('click')
+      await wrapper.get('#key-form-advanced input[type="number"]').setValue(12)
+      await wrapper.get('[data-test="close-dialog"]').trigger('click')
+      await wrapper.get('[data-tour="keys-create-btn"]').trigger('click')
+      expect(wrapper.find('#key-form-advanced').exists()).toBe(false)
+      await wrapper.get('#key-form').trigger('submit')
+      expect(vi.mocked(keysAPI.create).mock.calls[0].slice(0, 6)).toEqual([
+        'keys.namePlaceholder', 2, undefined, [], [], 0,
+      ])
+    })
+
+    it('keeps the full edit form when simplified creation is enabled', async () => {
+      getPublicSettings.mockResolvedValue({ simplified_key_creation_enabled: true })
+      const wrapper = await mountView()
+      await getButtonByText(wrapper, 'common.edit').trigger('click')
+      expect(optionIds(wrapper)).toEqual(availableGroups.map((group) => group.id))
+      expect(wrapper.get<HTMLInputElement>('[data-tour="key-form-name"]').element.value).toBe('test-key')
+      expect(wrapper.find('[data-testid="key-advanced-toggle"]').exists()).toBe(false)
+      expect(wrapper.find('#key-form-advanced').exists()).toBe(true)
+    })
+
     it('classifies all configured platforms and retains the complete table filter', async () => {
       const wrapper = await openCreate()
       expect(wrapper.findAll('input[name="key-provider"]')).toHaveLength(4)

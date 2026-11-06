@@ -113,6 +113,7 @@ export default {
     importToCcSwitch: '导入到 CCS',
     enable: '启用',
     disable: '禁用',
+    advancedSettings: '高级设置',
     nameLabel: '名称',
     namePlaceholder: '我的 API 密钥',
     groupLabel: '分组',

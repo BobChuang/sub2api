@@ -749,6 +749,21 @@ describe("admin SettingsView payment visible method controls", () => {
     wrapper.unmount();
   });
 
+  it.each([false, true])("loads and saves simplified key creation from %s", async (enabled) => {
+    getSettings.mockResolvedValue({ ...baseSettingsResponse, simplified_key_creation_enabled: enabled });
+    const wrapper = mountView();
+    await flushPromises();
+    const toggle = wrapper.get<HTMLInputElement>('[data-testid="simplified-key-creation-toggle"]');
+    expect(toggle.element.checked).toBe(enabled);
+    await toggle.setValue(!enabled);
+    await wrapper.find("form").trigger("submit.prevent");
+    await flushPromises();
+    expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ simplified_key_creation_enabled: !enabled }),
+    );
+    wrapper.unmount();
+  });
+
   it("submits the compact home page toggle", async () => {
     const wrapper = mountView();
     await flushPromises();
