@@ -230,6 +230,13 @@ security:
 # 网关配置
 # =============================================================================
 gateway:
+  # Optional: API key ID -> fallback account ID for Chat Completions.
+  # On the first retryable upstream failure, try this account once, independently
+  # of max_account_switches. Eligibility checks still apply. Already emitted
+  # response bytes, client cancellation and non-retryable policy errors cannot
+  # be replayed. Unlisted API keys retain their normal retry behavior.
+  # chat_completions_fallback_accounts:
+  #   9: 353
   # Minimum max_output_tokens when converting Chat Completions or Anthropic requests to Responses (minimum 16, default 128)
   # Chat Completions 或 Anthropic 请求转换为 Responses 时的最小 max_output_tokens（最小 16，默认 128）
   min_output_tokens: 128

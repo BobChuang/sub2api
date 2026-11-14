@@ -1168,6 +1168,10 @@ type GatewayConfig struct {
 
 	// 账户切换最大次数（遇到上游错误时切换到其他账户的次数上限）
 	MaxAccountSwitches int `mapstructure:"max_account_switches"`
+	// ChatCompletionsFallbackAccounts maps API key IDs to a final fallback account.
+	// After the first retryable upstream failure, try this account once instead
+	// of rotating through the regular pool. Normal eligibility checks still apply.
+	ChatCompletionsFallbackAccounts map[int64]int64 `mapstructure:"chat_completions_fallback_accounts"`
 	// Gemini 账户切换最大次数（Gemini 平台单独配置，因 API 限制更严格）
 	MaxAccountSwitchesGemini int `mapstructure:"max_account_switches_gemini"`
 	// Gemini 同账号重试次数（429/5xx 等可重试错误在换号前对同一账号的重发次数，不含首次请求）

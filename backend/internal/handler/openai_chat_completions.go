@@ -168,6 +168,11 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	sameAccountRetryCount := make(map[int64]int)
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
+	var fallbackAccountID int64
+	if h.cfg != nil {
+		fallbackAccountID = h.cfg.Gateway.ChatCompletionsFallbackAccounts[apiKey.ID]
+	}
+	fallbackPending, fallbackAttempted := false, false
 
 	// 分组利润控制：chat completions 文本入口请求级装门并固定 pricingAt。
 	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
@@ -178,24 +183,36 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			return
 		}
 		reqLog.Debug("openai_chat_completions.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
-			apiKey.GroupID,
-			"",
-			sessionHash,
-			forwardModel,
-			failedAccountIDs,
-			service.OpenAIUpstreamTransportAny,
-			service.OpenAIEndpointCapabilityChatCompletions,
-			false,
-			false,
-			true,
-			requestPlatform,
-		)
+		selectAccount := func() (*service.AccountSelectionResult, service.OpenAIAccountScheduleDecision, error) {
+			if fallbackPending {
+				fallbackPending, fallbackAttempted = false, true
+				return h.gatewayService.SelectChatCompletionsFallbackAccount(c.Request.Context(), apiKey.GroupID, forwardModel, fallbackAccountID, requestPlatform)
+			}
+			return h.gatewayService.SelectAccountWithSchedulerForCapability(
+				c.Request.Context(),
+				apiKey.GroupID,
+				"",
+				sessionHash,
+				forwardModel,
+				failedAccountIDs,
+				service.OpenAIUpstreamTransportAny,
+				service.OpenAIEndpointCapabilityChatCompletions,
+				false,
+				false,
+				true,
+				requestPlatform,
+			)
+		}
+		selection, scheduleDecision, err := selectAccount()
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("openai_chat_completions.account_select_aborted_client_disconnected", zap.Error(err))
 				return
+			}
+			if fallbackAccountID > 0 && !fallbackAttempted {
+				fallbackPending = true
+				reqLog.Warn("openai_chat_completions.explicit_fallback_after_selection_failure", zap.Int64("fallback_account_id", fallbackAccountID))
+				continue
 			}
 			reqLog.Warn("openai_chat_completions.account_select_failed",
 				zap.Error(openAICompatibleSelectionErrorForLog(err, requestPlatform)),
@@ -232,8 +249,16 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		_ = scheduleDecision
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
-		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
+		accountSessionHash := sessionHash
+		if fallbackAttempted {
+			accountSessionHash = ""
+		}
+		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, accountSessionHash, selection, reqStream, &streamStarted, reqLog)
 		if slotResult == openAISlotAcquireProfitVetoed {
+			if fallbackAttempted {
+				h.handleOpenAIProfitVetoExhausted(c, streamStarted, reqLog, profitVetoCount+1)
+				return
+			}
 			// 利润终检否决：排除该账号重新选号；否决次数达上限则按无可用账号终止。
 			if !recordOpenAIProfitVeto(failedAccountIDs, account.ID, &profitVetoCount) {
 				h.handleOpenAIProfitVetoExhausted(c, streamStarted, reqLog, profitVetoCount)
@@ -261,6 +286,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			}()
 			return h.gatewayService.ForwardAsChatCompletions(c.Request.Context(), c, account, forwardBody, promptCacheKey, "")
 		}()
+		streamStarted = streamStarted || c.Writer.Written()
 		var cyberBlockBodyChat []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyChat = body
@@ -349,6 +375,24 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 					if !failoverErr.ShouldRetryNextAccount() {
 						h.handleFailoverExhausted(c, failoverErr, streamStarted)
 						return
+					}
+					if fallbackAccountID > 0 {
+						// The fallback has its own single attempt, independent of
+						// the regular pool's switch budget (including a zero budget).
+						if fallbackAttempted || account.ID == fallbackAccountID {
+							h.handleFailoverExhausted(c, failoverErr, streamStarted)
+							return
+						}
+						failedAccountIDs[account.ID] = struct{}{}
+						lastFailoverErr = failoverErr
+						fallbackPending = true
+						h.gatewayService.RecordOpenAIAccountSwitch()
+						reqLog.Warn("openai_chat_completions.explicit_fallback_switching",
+							zap.Int64("account_id", account.ID),
+							zap.Int64("fallback_account_id", fallbackAccountID),
+							zap.Int("upstream_status", failoverErr.StatusCode),
+						)
+						continue
 					}
 					// Pool mode: retry on the same account
 					if failoverErr.RetryableOnSameAccount {
