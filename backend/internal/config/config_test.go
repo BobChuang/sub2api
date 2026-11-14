@@ -27,11 +27,12 @@ func resetViperWithJWTSecret(t *testing.T) {
 func TestLoadChatCompletionsFallbackAccounts(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	path := filepath.Join(t.TempDir(), "fallback.yaml")
-	require.NoError(t, os.WriteFile(path, []byte("gateway:\n  chat_completions_fallback_accounts:\n    9: 353\n"), 0600))
+	require.NoError(t, os.WriteFile(path, []byte("gateway:\n  chat_completions_fallback_accounts:\n    9: 353\n  chat_completions_attempt_timeout_seconds:\n    9: 300\n"), 0600))
 	t.Setenv("CONFIG_FILE", path)
 	cfg, err := Load()
 	require.NoError(t, err)
 	require.Equal(t, map[int64]int64{9: 353}, cfg.Gateway.ChatCompletionsFallbackAccounts)
+	require.Equal(t, map[int64]int{9: 300}, cfg.Gateway.ChatCompletionsAttemptTimeoutSeconds)
 }
 
 func TestLoadDefaultModelsListReadMaxBytes(t *testing.T) {

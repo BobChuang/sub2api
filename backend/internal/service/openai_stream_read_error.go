@@ -70,6 +70,9 @@ func OpenAIUpstreamStreamReadErrorDetails(err error) (code, message string, ok b
 
 func classifyOpenAIUpstreamStreamReadError(err error) (code, message string) {
 	if err != nil {
+		if errors.Is(err, errOpenAIChatAttemptTimeout) {
+			return OpenAIChatAttemptTimeoutCode, "Upstream request exceeded its time limit"
+		}
 		if errors.Is(err, ErrOpenAIUpstreamStreamTruncated) {
 			return OpenAIUpstreamStreamTruncatedCode, "Upstream response stream ended before completion"
 		}

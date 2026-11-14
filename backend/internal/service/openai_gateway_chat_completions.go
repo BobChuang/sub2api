@@ -1329,12 +1329,21 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 // writeChatCompletionsError writes an error response in OpenAI Chat Completions format.
 func writeChatCompletionsError(c *gin.Context, statusCode int, errType, message string) {
 	MarkResponseCommitted(c)
-	c.JSON(statusCode, gin.H{
+	payload := gin.H{
 		"error": gin.H{
 			"type":    errType,
 			"message": message,
 		},
-	})
+	}
+	heartbeatCommitted := StopOpenAICompactSSEKeepaliveCommitted(c)
+	if heartbeatCommitted || (c.Writer.Written() && strings.HasPrefix(c.Writer.Header().Get("Content-Type"), "text/event-stream")) {
+		MarkOpsStreamError(c, errType, message, statusCode)
+		body, _ := json.Marshal(payload)
+		_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", body)
+		c.Writer.Flush()
+		return
+	}
+	c.JSON(statusCode, payload)
 }
 
 // buildChatStreamErrorSSE builds one SSE data frame carrying an OpenAI chat

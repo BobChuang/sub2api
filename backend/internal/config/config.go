@@ -1172,6 +1172,9 @@ type GatewayConfig struct {
 	// After the first retryable upstream failure, try this account once instead
 	// of rotating through the regular pool. Normal eligibility checks still apply.
 	ChatCompletionsFallbackAccounts map[int64]int64 `mapstructure:"chat_completions_fallback_accounts"`
+	// Per-key total duration of each raw Chat Completions upstream attempt.
+	// Zero/unlisted keys retain the upstream's existing timeout behavior.
+	ChatCompletionsAttemptTimeoutSeconds map[int64]int `mapstructure:"chat_completions_attempt_timeout_seconds"`
 	// Gemini 账户切换最大次数（Gemini 平台单独配置，因 API 限制更严格）
 	MaxAccountSwitchesGemini int `mapstructure:"max_account_switches_gemini"`
 	// Gemini 同账号重试次数（429/5xx 等可重试错误在换号前对同一账号的重发次数，不含首次请求）

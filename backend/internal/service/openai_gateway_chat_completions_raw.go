@@ -72,6 +72,11 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	defaultMappedModel string,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
+	attempt := s.newChatAttemptTimeout(ctx, c)
+	if attempt != nil {
+		defer attempt.cancel()
+		ctx = context.WithValue(ctx, chatAttemptTimeoutKey{}, attempt)
+	}
 
 	// 1. Parse minimal fields needed for routing/billing
 	originalModel := gjson.GetBytes(body, "model").String()
@@ -213,15 +218,33 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	// the outbound request (for example GLM xhigh is forwarded as max).
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(upstreamBody, upstreamModel, billingModel, originalModel)
 	reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, upstreamBody, upstreamModel)
+	if attempt != nil && clientStream {
+		interval := 15 * time.Second
+		if s.cfg.Gateway.StreamKeepaliveInterval > 0 {
+			interval = time.Duration(s.cfg.Gateway.StreamKeepaliveInterval) * time.Second
+		}
+		stopKeepalive := startChatAttemptKeepalive(c, interval)
+		defer stopKeepalive()
+	}
 	resp, err := s.sendCCUpstreamRequest(ctx, c, account, targetURL, upstreamBody, clientStream, token, customUA, grokCacheIdentity)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if attempt != nil {
+		// Closing the body also unblocks transports/plugins whose body reader
+		// does not itself observe the HTTP request context's deadline.
+		responseBody := resp.Body
+		stop := context.AfterFunc(attempt.ctx, func() { _ = responseBody.Close() })
+		defer stop()
+	}
 
 	// 7. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+		if attempt.expired(c) {
+			return nil, newChatAttemptTimeoutError(c, account, resp.Header.Get("x-request-id"), false)
+		}
 		if account.Platform == PlatformGrok {
 			kind := "http_error"
 			if s.shouldFailoverGrokUpstreamError(resp.StatusCode, respBody) {
@@ -268,9 +291,9 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	var result *OpenAIForwardResult
 	var forwardErr error
 	if clientStream {
-		result, forwardErr = s.streamRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, len(body))
+		result, forwardErr = s.streamRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, len(body), attempt)
 	} else {
-		result, forwardErr = s.bufferRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		result, forwardErr = s.bufferRawChatCompletions(c, resp, account, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, attempt)
 	}
 	if result != nil {
 		addOpenAIUsage(&result.Usage, bridgeUsage)
@@ -308,6 +331,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	serviceTier *string,
 	startTime time.Time,
 	requestBodyLen int,
+	attempt *chatAttemptTimeout,
 ) (*OpenAIForwardResult, error) {
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
@@ -322,11 +346,22 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	clientDisconnected := false
 	clientOutputStarted := false
 	pendingLines := make([]string, 0, 8)
+	pendingBytes := 0
+	timeoutOutputReady := attempt == nil
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var terminal openAIRawStreamTerminalState
 
 	writeLine := func(line string) {
 		if clientDisconnected {
+			return
+		}
+		if !clientOutputStarted && !timeoutOutputReady {
+			// Only retain a bounded prefix. Repeated upstream heartbeats must
+			// not consume unbounded memory while waiting for the deadline.
+			if pendingBytes+len(line)+1 <= 64*1024 {
+				pendingLines = append(pendingLines, line)
+				pendingBytes += len(line) + 1
+			}
 			return
 		}
 		if !clientOutputStarted && !refusalDetector.ShouldReleaseClientOutput() {
@@ -362,6 +397,9 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		refusalDetector.ObserveSSELine(line)
 		if payload, ok := extractOpenAISSEDataLine(line); ok {
 			trimmedPayload := strings.TrimSpace(payload)
+			if !timeoutOutputReady && chatTimeoutPayloadStartsOutput(trimmedPayload) {
+				timeoutOutputReady = true
+			}
 			terminal.ObserveDataLine(trimmedPayload)
 			if trimmedPayload != "[DONE]" {
 				observer.ObserveOpenAI([]byte(payload), strings.TrimSpace(gjson.Get(payload, "type").String()))
@@ -411,6 +449,12 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	}
 
 	scanErr := scanner.Err()
+	if attempt.expired(c) {
+		if !clientOutputStarted {
+			return nil, newChatAttemptTimeoutError(c, account, requestID, false)
+		}
+		return resultWithUsage(), newChatAttemptTimeoutError(c, account, requestID, true)
+	}
 	if scanErr != nil && !errors.Is(scanErr, context.Canceled) && !errors.Is(scanErr, context.DeadlineExceeded) {
 		logger.L().Warn("openai chat_completions raw: stream read error",
 			zap.Error(scanErr),
@@ -523,10 +567,18 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	reasoningEffort *string,
 	serviceTier *string,
 	startTime time.Time,
+	attempts ...*chatAttemptTimeout,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
+	var attempt *chatAttemptTimeout
+	if len(attempts) > 0 {
+		attempt = attempts[0]
+	}
 
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	if attempt.expired(c) {
+		return nil, newChatAttemptTimeoutError(c, account, requestID, false)
+	}
 	if err != nil {
 		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {
 			writeChatCompletionsError(c, http.StatusBadGateway, "api_error", "Failed to read upstream response")

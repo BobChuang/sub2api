@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
@@ -28,18 +29,39 @@ type chatFallbackUpstream struct {
 	primaryStream  string
 	transportError bool
 	cancel         context.CancelFunc
+	holdHeaders    bool
+	holdBody       bool
+	holdFallback   bool
+	deadlines      []time.Time
 }
 
 func (u *chatFallbackUpstream) Do(req *http.Request, _ string, id int64, _ int) (*http.Response, error) {
 	body, _ := io.ReadAll(req.Body)
 	u.hits = append(u.hits, id)
 	u.models = append(u.models, gjson.GetBytes(body, "model").String())
+	deadline, _ := req.Context().Deadline()
+	u.deadlines = append(u.deadlines, deadline)
 	if id != 353 && u.cancel != nil {
 		u.cancel()
 		return nil, context.Canceled
 	}
 	if id != 353 && u.transportError {
 		return nil, errors.New("upstream connection reset")
+	}
+	if (id != 353 && u.holdHeaders) || (id == 353 && u.holdFallback) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	}
+	if id != 353 && u.holdBody {
+		reader, writer := io.Pipe()
+		go func() {
+			defer writer.Close()
+			if u.primaryStream != "" {
+				_, _ = io.WriteString(writer, u.primaryStream)
+			}
+			<-req.Context().Done()
+		}()
+		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}, nil
 	}
 	status := u.primaryStatus
 	if id == 353 {
@@ -67,7 +89,8 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 		primaryStream                                                                                 string
 		wantHits                                                                                      []int64
 		wantStatus                                                                                    int
-		wantStreamError                                                                               bool
+		timeoutSeconds                                                                                int
+		holdHeaders, holdBody, holdFallback, wantStreamError, wantHeartbeat                           bool
 	}{
 		{name: "429 skips remaining primary accounts", primary: 429, wantHits: []int64{801, 353}, wantStatus: 200},
 		{name: "500 uses reserved attempt with zero switch budget", primary: 500, wantHits: []int64{801, 353}, wantStatus: 200},
@@ -85,9 +108,27 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 		{name: "fallback outside key group is rejected", primary: 429, wrongGroup: true, wantHits: []int64{801}, wantStatus: 429},
 		{name: "client cancellation never retries", canceled: true, wantHits: []int64{801}, wantStatus: 200},
 		{name: "healthy primary never calls fallback", wantHits: []int64{801}, wantStatus: 200},
+		{name: "header timeout uses fallback", timeoutSeconds: 1, holdHeaders: true, wantHits: []int64{801, 353}, wantStatus: 200},
+		{name: "nonstream body timeout uses fallback", timeoutSeconds: 1, holdBody: true, wantHits: []int64{801, 353}, wantStatus: 200},
+		{name: "empty role prefix remains replayable", timeoutSeconds: 1, holdBody: true, stream: true, primaryStream: "data: {\"id\":\"primary-marker\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n", wantHits: []int64{801, 353}, wantStatus: 200},
+		{name: "heartbeats do not prevent fallback", timeoutSeconds: 2, holdBody: true, stream: true, wantHeartbeat: true, wantHits: []int64{801, 353}, wantStatus: 200},
+		{name: "content timeout fails without replay", timeoutSeconds: 1, holdBody: true, stream: true, primaryStream: "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", wantStreamError: true, wantHits: []int64{801}, wantStatus: 200},
+		{name: "reasoning timeout fails without replay", timeoutSeconds: 1, holdBody: true, stream: true, primaryStream: "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n", wantStreamError: true, wantHits: []int64{801}, wantStatus: 200},
+		{name: "tool call timeout fails without replay", timeoutSeconds: 1, holdBody: true, stream: true, primaryStream: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"run\"}}]}}]}\n\n", wantStreamError: true, wantHits: []int64{801}, wantStatus: 200},
+		{name: "fallback receives its own bounded deadline", timeoutSeconds: 1, holdHeaders: true, holdFallback: true, wantHits: []int64{801, 353}, wantStatus: 504},
+		{name: "exhausted timeout after heartbeat counts as failure", timeoutSeconds: 2, stream: true, wantHeartbeat: true, holdHeaders: true, holdFallback: true, wantHits: []int64{801, 353}, wantStatus: 200},
+		{name: "client cancellation with deadline never retries", timeoutSeconds: 1, canceled: true, wantHits: []int64{801}, wantStatus: 200},
+		{name: "healthy primary with deadline never retries", timeoutSeconds: 1, wantHits: []int64{801}, wantStatus: 200},
+		{name: "empty terminal stream completes before deadline", timeoutSeconds: 1, stream: true, primaryStream: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", wantHits: []int64{801}, wantStatus: 200},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{RunMode: config.RunModeSimple}
+			if tc.timeoutSeconds > 0 {
+				cfg.Gateway.ChatCompletionsAttemptTimeoutSeconds = map[int64]int{9: tc.timeoutSeconds}
+			}
+			if tc.wantHeartbeat {
+				cfg.Gateway.StreamKeepaliveInterval = 1
+			}
 			if tc.wrongGroup {
 				cfg.RunMode = config.RunModeStandard
 			}
@@ -125,7 +166,7 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 				accounts[len(accounts)-1].AccountGroups = []service.AccountGroup{{AccountID: 353, GroupID: 11}}
 			}
 			repo := &grokCredentialHandlerRepo{accounts: accounts}
-			upstream := &chatFallbackUpstream{primaryStatus: tc.primary, fallbackStatus: tc.fallback, primaryStream: tc.primaryStream, transportError: tc.transport}
+			upstream := &chatFallbackUpstream{primaryStatus: tc.primary, fallbackStatus: tc.fallback, primaryStream: tc.primaryStream, transportError: tc.transport, holdHeaders: tc.holdHeaders, holdBody: tc.holdBody, holdFallback: tc.holdFallback}
 			billingCache := service.NewBillingCacheService(newHandlerInflightCache(100), nil, nil, nil, nil, nil, cfg, nil)
 			t.Cleanup(billingCache.Stop)
 			gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, cfg, nil, nil, service.NewBillingService(cfg, nil), nil, billingCache, upstream, &service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil)
@@ -159,8 +200,26 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 			if tc.wantStreamError {
 				require.NotContains(t, rec.Body.String(), "fallback answer")
 				require.Contains(t, rec.Body.String(), `"error"`)
+				if tc.timeoutSeconds > 0 {
+					require.Contains(t, rec.Body.String(), service.OpenAIChatAttemptTimeoutCode)
+				}
 			}
-
+			if tc.holdFallback {
+				require.True(t, upstream.deadlines[1].After(upstream.deadlines[0].Add(900*time.Millisecond)))
+				require.Contains(t, rec.Body.String(), service.OpenAIChatAttemptTimeoutCode)
+			}
+			if tc.stream && tc.timeoutSeconds > 0 && (tc.wantStreamError || tc.holdFallback) {
+				errors := service.GetOpsStreamErrors(c)
+				require.Len(t, errors, 1)
+				require.True(t, errors[0].CountTowardsSLA)
+				require.Equal(t, http.StatusGatewayTimeout, errors[0].IntendedStatus)
+			}
+			if tc.wantHeartbeat {
+				require.Contains(t, rec.Body.String(), ": keepalive\n\n")
+			}
+			if len(upstream.hits) == 2 && tc.holdBody {
+				require.NotContains(t, rec.Body.String(), "primary-marker")
+			}
 		})
 	}
 }

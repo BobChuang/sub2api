@@ -237,6 +237,12 @@ gateway:
   # be replayed. Unlisted API keys retain their normal retry behavior.
   # chat_completions_fallback_accounts:
   #   9: 353
+  # Optional per-key total timeout for each raw Chat Completions attempt.
+  # Pending/empty chunks remain replayable; actual content, reasoning and tool
+  # calls cannot be replayed. An expired attempt is always an upstream failure.
+  # The fallback receives its own fresh timeout. Unlisted keys are unchanged.
+  # chat_completions_attempt_timeout_seconds:
+  #   9: 300
   # Minimum max_output_tokens when converting Chat Completions or Anthropic requests to Responses (minimum 16, default 128)
   # Chat Completions 或 Anthropic 请求转换为 Responses 时的最小 max_output_tokens（最小 16，默认 128）
   min_output_tokens: 128
