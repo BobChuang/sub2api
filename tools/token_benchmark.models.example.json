@@ -1,0 +1,14 @@
+{
+  "cline": {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+    "deepseek-v4-pro": "deepseek-v4-pro"
+  },
+  "opencode": {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+    "deepseek-v4-pro": "deepseek-v4-pro"
+  },
+  "commandcode": {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+    "deepseek-v4-pro": "deepseek-v4-pro"
+  }
+}
