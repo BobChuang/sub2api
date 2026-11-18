@@ -53,6 +53,15 @@ func (s *settingHandlerPublicRepoStub) Delete(ctx context.Context, key string) e
 	panic("unexpected Delete call")
 }
 
+func TestProvideSettingHandler_SetsInjectedVersion(t *testing.T) {
+	settings := service.NewSettingService(&settingHandlerPublicRepoStub{}, &config.Config{})
+	ProvideSettingHandler(settings, BuildInfo{Version: "0.2.23"}, nil)
+
+	payload, err := settings.GetPublicSettingsForInjection(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, "0.2.23", payload.(*service.PublicSettingsInjectionPayload).Version)
+}
+
 func TestSettingHandler_GetPublicSettings_ExposesForceEmailOnThirdPartySignup(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
