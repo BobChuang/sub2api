@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -598,7 +599,7 @@ func TestClineUsageProbeAuthFailure(t *testing.T) {
 
 // 周期检测探测官方主机上的全部激活账号（含手动停调的，钱包冷却与调度开关无关），
 // 只冷却钱包，不停整个账号。
-func TestCNProviderBalanceCheckRunOnceProbesClineUsage(t *testing.T) {
+func TestCNProviderBalanceCheckStaggersClineUsage(t *testing.T) {
 	official := *clineTestAccount(1)
 	manualOff := *clineTestAccount(2)
 	manualOff.Schedulable = false
@@ -609,25 +610,36 @@ func TestCNProviderBalanceCheckRunOnceProbesClineUsage(t *testing.T) {
 	repo := &clineAccountRepo{accounts: []Account{official, manualOff, relay}}
 	upstream := newClineAccountUpstream(commandCodeAlphaResponse{status: http.StatusOK, body: clineUsageLimitsBody}, `{"success":true,"data":{"balance":200000}}`)
 	cfg := clineUsageTestConfig()
-	svc := &CNProviderBalanceCheckService{
-		accountRepo:    repo,
-		balanceService: NewCNProviderBalanceService(repo, nil, upstream, cfg),
-		quotaService:   NewCNProviderQuotaService(repo, nil, upstream, cfg),
-		cfg:            cfg,
-	}
+	cfg.Gateway.CNProviders.BalanceCheckEnabled = true
 
-	svc.runOnce()
+	synctest.Test(t, func(t *testing.T) {
+		svc := NewCNProviderBalanceCheckService(repo, NewCNProviderBalanceService(repo, nil, upstream, cfg), NewCNProviderQuotaService(repo, nil, upstream, cfg), cfg, 10*time.Minute)
+		svc.Start()
+		defer svc.Stop()
 
-	require.Len(t, upstream.requests, 6, "usage-limits + me + balance for each official account")
-	require.Len(t, repo.extraWrites, 2)
-	require.Contains(t, repo.modelLimits[1], clineCreditsRateLimitKey)
-	require.Contains(t, repo.modelLimits[2], clineCreditsRateLimitKey)
-	require.Empty(t, repo.paused)
+		time.Sleep(5*time.Minute - time.Second)
+		synctest.Wait()
+		require.Empty(t, upstream.requests, "no burst at startup")
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.Len(t, upstream.requests, 3, "one account at the first slot")
+		require.Contains(t, repo.modelLimits[1], clineCreditsRateLimitKey)
+
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+		require.Len(t, upstream.requests, 6, "one more account at the second slot")
+		require.Len(t, repo.extraWrites, 2)
+		require.Contains(t, repo.modelLimits[2], clineCreditsRateLimitKey)
+		require.Empty(t, repo.paused)
+
+		time.Sleep(5 * time.Minute)
+		synctest.Wait()
+		require.Len(t, upstream.requests, 9, "next cycle starts at the same spacing")
+	})
 }
 
-// 同一轮检测里每个账号走自己平台登记的检测函数：积分同样低于阈值，Command Code 停整个
-// 账号，Cline 不停（钱包冷却在探测中处理）。
-func TestCNProviderBalanceCheckRunOnceDispatchesAccountProbesByPlatform(t *testing.T) {
+// Cline 走独立的错峰任务，不能再进入其他平台的批量探测。
+func TestCNProviderBalanceCheckRunOnceLeavesClineToStaggeredRunner(t *testing.T) {
 	commandCode := *commandCodeUsageAccount()
 	commandCode.ID, commandCode.Schedulable = 1, true
 	cline := *clineTestAccount(2)
@@ -637,7 +649,7 @@ func TestCNProviderBalanceCheckRunOnceDispatchesAccountProbesByPlatform(t *testi
 
 	svc.runOnce()
 
-	require.ElementsMatch(t, []int64{1, 2}, prober.probed)
+	require.Equal(t, []int64{1}, prober.probed)
 	require.Equal(t, []int64{1}, repo.paused)
 }
 
