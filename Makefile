@@ -1,4 +1,5 @@
 .PHONY: build build-backend build-frontend test test-backend test-frontend test-frontend-critical
+RELEASE_BUILD ?= $(wildcard /usr/local/bin/release-build)
 
 FRONTEND_CRITICAL_VITEST := \
 	src/i18n/__tests__/localeKeyCompleteness.spec.ts \
@@ -42,7 +43,7 @@ build-backend:
 
 # 编译前端（需要已安装依赖）
 build-frontend:
-	@pnpm --dir frontend run build
+	@$(RELEASE_BUILD) pnpm --dir frontend run build
 
 # 运行测试（后端 + 前端）
 test: test-backend test-frontend

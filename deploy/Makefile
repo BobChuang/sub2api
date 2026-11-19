@@ -2,6 +2,7 @@
 
 VERSION ?= $(shell ./scripts/resolve-version.sh)
 LDFLAGS ?= -s -w -X main.Version=$(VERSION)
+RELEASE_BUILD ?= $(wildcard /usr/local/bin/release-build)
 
 wire:
 	@echo "生成 Wire 代码..."
@@ -10,12 +11,12 @@ wire:
 
 build:
 	@echo "构建后端（不嵌入前端）..."
-	@go build -ldflags="$(LDFLAGS)" -o bin/server ./cmd/server
+	@$(RELEASE_BUILD) go build -ldflags="$(LDFLAGS)" -o bin/server ./cmd/server
 	@echo "构建完成: bin/server"
 
 build-embed:
 	@echo "构建后端（嵌入前端）..."
-	@go build -tags embed -ldflags="$(LDFLAGS)" -o bin/server ./cmd/server
+	@$(RELEASE_BUILD) go build -tags embed -ldflags="$(LDFLAGS)" -o bin/server ./cmd/server
 	@echo "构建完成: bin/server (with embedded frontend)"
 
 test-unit:
