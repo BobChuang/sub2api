@@ -243,6 +243,15 @@ gateway:
   # The fallback receives its own fresh timeout. Unlisted keys are unchanged.
   # chat_completions_attempt_timeout_seconds:
   #   9: 300
+  # Optional per-key timeouts for raw streaming Chat Completions (seconds).
+  # Each attempt gets its own first-output and idle timers. The total budget
+  # is shared by the primary and fallback attempts. For these streams this
+  # replaces chat_completions_attempt_timeout_seconds.
+  # chat_completions_stream_timeouts:
+  #   9:
+  #     first_output_timeout_seconds: 15
+  #     idle_timeout_seconds: 60
+  #     total_timeout_seconds: 300
   # Minimum max_output_tokens when converting Chat Completions or Anthropic requests to Responses (minimum 16, default 128)
   # Chat Completions 或 Anthropic 请求转换为 Responses 时的最小 max_output_tokens（最小 16，默认 128）
   min_output_tokens: 128

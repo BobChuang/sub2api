@@ -22,17 +22,18 @@ import (
 
 type chatFallbackUpstream struct {
 	service.HTTPUpstream
-	hits           []int64
-	models         []string
-	primaryStatus  int
-	fallbackStatus int
-	primaryStream  string
-	transportError bool
-	cancel         context.CancelFunc
-	holdHeaders    bool
-	holdBody       bool
-	holdFallback   bool
-	deadlines      []time.Time
+	hits                  []int64
+	models                []string
+	primaryStatus         int
+	fallbackStatus        int
+	primaryStream         string
+	transportError        bool
+	cancel                context.CancelFunc
+	holdHeaders           bool
+	holdBody              bool
+	holdFallback          bool
+	deadlines             []time.Time
+	primaryStreamInterval time.Duration
 }
 
 func (u *chatFallbackUpstream) Do(req *http.Request, _ string, id int64, _ int) (*http.Response, error) {
@@ -57,9 +58,26 @@ func (u *chatFallbackUpstream) Do(req *http.Request, _ string, id int64, _ int) 
 		go func() {
 			defer writer.Close()
 			if u.primaryStream != "" {
-				_, _ = io.WriteString(writer, u.primaryStream)
+				if _, err := io.WriteString(writer, u.primaryStream); err != nil {
+					return
+				}
 			}
-			<-req.Context().Done()
+			if u.primaryStreamInterval <= 0 {
+				<-req.Context().Done()
+				return
+			}
+			ticker := time.NewTicker(u.primaryStreamInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-req.Context().Done():
+					return
+				case <-ticker.C:
+					if _, err := io.WriteString(writer, u.primaryStream); err != nil {
+						return
+					}
+				}
+			}
 		}()
 		return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: reader}, nil
 	}
@@ -82,6 +100,8 @@ func (u *chatFallbackUpstream) Do(req *http.Request, _ string, id int64, _ int) 
 
 func TestChatCompletionsExplicitFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	const rolePrefix = "data: {\"id\":\"primary-marker\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n"
+	const partialOutput = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
 	for _, tc := range []struct {
 		name                                                                                          string
 		primary, fallback                                                                             int
@@ -91,6 +111,11 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 		wantStatus                                                                                    int
 		timeoutSeconds                                                                                int
 		holdHeaders, holdBody, holdFallback, wantStreamError, wantHeartbeat                           bool
+		streamTimeout                                                                                 config.ChatCompletionsStreamTimeoutConfig
+		streamTimeoutKey                                                                              int64
+		primaryStreamInterval                                                                         time.Duration
+		wantTimeoutCode, wantOutput                                                                   string
+		wantPromptTerminal                                                                            bool
 	}{
 		{name: "429 skips remaining primary accounts", primary: 429, wantHits: []int64{801, 353}, wantStatus: 200},
 		{name: "500 uses reserved attempt with zero switch budget", primary: 500, wantHits: []int64{801, 353}, wantStatus: 200},
@@ -120,11 +145,65 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 		{name: "client cancellation with deadline never retries", timeoutSeconds: 1, canceled: true, wantHits: []int64{801}, wantStatus: 200},
 		{name: "healthy primary with deadline never retries", timeoutSeconds: 1, wantHits: []int64{801}, wantStatus: 200},
 		{name: "empty terminal stream completes before deadline", timeoutSeconds: 1, stream: true, primaryStream: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", wantHits: []int64{801}, wantStatus: 200},
+		{
+			name: "first output timeout ignores role and heartbeats and switches once", stream: true, holdBody: true,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 1, TotalTimeoutSeconds: 4},
+			primaryStream: rolePrefix, wantHeartbeat: true, wantOutput: "fallback answer", wantHits: []int64{801, 353}, wantStatus: 200,
+		},
+		{
+			name: "retryable upstream SSE error before output switches once", stream: true,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 1, TotalTimeoutSeconds: 4},
+			primaryStream: "data: {\"error\":{\"message\":\"temporarily unavailable\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n",
+			wantOutput:    "fallback answer", wantHits: []int64{801, 353}, wantStatus: 200,
+		},
+		{
+			name: "invalid request SSE error before output retains its original response", stream: true,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 1, TotalTimeoutSeconds: 4},
+			primaryStream: "data: {\"error\":{\"message\":\"invalid request\",\"type\":\"invalid_request_error\"}}\n\ndata: [DONE]\n\n",
+			wantOutput:    "invalid_request_error", wantHits: []int64{801}, wantStatus: 200,
+		},
+		{
+			name: "idle after output sends an SSE error without replay", stream: true, holdBody: true,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 1, TotalTimeoutSeconds: 4},
+			primaryStream: partialOutput, wantStreamError: true, wantOutput: "partial", wantTimeoutCode: "upstream_stream_idle_timeout", wantHits: []int64{801}, wantStatus: 200,
+		},
+		{
+			name: "fallback shares the total budget with the first attempt", stream: true, holdHeaders: true, holdFallback: true,
+			streamTimeout:   config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 1, TotalTimeoutSeconds: 3},
+			wantTimeoutCode: "upstream_request_timeout", wantHits: []int64{801, 353}, wantStatus: 504,
+		},
+		{
+			name: "total timeout applies even while output keeps arriving", stream: true, holdBody: true,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 1, TotalTimeoutSeconds: 3},
+			primaryStream: partialOutput, primaryStreamInterval: 250 * time.Millisecond, wantStreamError: true, wantOutput: "partial", wantTimeoutCode: "upstream_request_timeout", wantHits: []int64{801}, wantStatus: 200,
+		},
+		{
+			name: "DONE completes the stream before the upstream closes", stream: true, holdBody: true,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 3, TotalTimeoutSeconds: 6},
+			primaryStream: partialOutput + "data: [DONE]\n\n", wantPromptTerminal: true, wantHits: []int64{801}, wantStatus: 200,
+		},
+		{
+			name: "another key retains the old timeout", stream: true, holdBody: true, timeoutSeconds: 1,
+			streamTimeout:    config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 2, TotalTimeoutSeconds: 4},
+			streamTimeoutKey: 10, primaryStream: partialOutput, wantStreamError: true, wantHits: []int64{801}, wantStatus: 200,
+		},
+		{
+			name: "nonstream retains the old timeout for the configured key", holdBody: true, timeoutSeconds: 1,
+			streamTimeout: config.ChatCompletionsStreamTimeoutConfig{FirstOutputTimeoutSeconds: 2, IdleTimeoutSeconds: 2, TotalTimeoutSeconds: 4},
+			wantHits:      []int64{801, 353}, wantStatus: 200,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := &config.Config{RunMode: config.RunModeSimple}
 			if tc.timeoutSeconds > 0 {
 				cfg.Gateway.ChatCompletionsAttemptTimeoutSeconds = map[int64]int{9: tc.timeoutSeconds}
+			}
+			if tc.streamTimeout.TotalTimeoutSeconds > 0 {
+				streamTimeoutKey := tc.streamTimeoutKey
+				if streamTimeoutKey == 0 {
+					streamTimeoutKey = 9
+				}
+				cfg.Gateway.ChatCompletionsStreamTimeouts = map[int64]config.ChatCompletionsStreamTimeoutConfig{streamTimeoutKey: tc.streamTimeout}
 			}
 			if tc.wantHeartbeat {
 				cfg.Gateway.StreamKeepaliveInterval = 1
@@ -166,7 +245,7 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 				accounts[len(accounts)-1].AccountGroups = []service.AccountGroup{{AccountID: 353, GroupID: 11}}
 			}
 			repo := &grokCredentialHandlerRepo{accounts: accounts}
-			upstream := &chatFallbackUpstream{primaryStatus: tc.primary, fallbackStatus: tc.fallback, primaryStream: tc.primaryStream, transportError: tc.transport, holdHeaders: tc.holdHeaders, holdBody: tc.holdBody, holdFallback: tc.holdFallback}
+			upstream := &chatFallbackUpstream{primaryStatus: tc.primary, fallbackStatus: tc.fallback, primaryStream: tc.primaryStream, transportError: tc.transport, holdHeaders: tc.holdHeaders, holdBody: tc.holdBody, holdFallback: tc.holdFallback, primaryStreamInterval: tc.primaryStreamInterval}
 			billingCache := service.NewBillingCacheService(newHandlerInflightCache(100), nil, nil, nil, nil, nil, cfg, nil)
 			t.Cleanup(billingCache.Stop)
 			gateway := service.NewOpenAIGatewayService(repo, nil, nil, nil, nil, nil, nil, cfg, nil, nil, service.NewBillingService(cfg, nil), nil, billingCache, upstream, &service.DeferredService{}, nil, nil, nil, nil, nil, nil, nil)
@@ -189,6 +268,7 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 			key := &service.APIKey{ID: 9, GroupID: &groupID, User: &service.User{ID: 1, Balance: 100, Status: service.StatusActive}, Group: &service.Group{ID: groupID, Hydrated: true, Platform: service.PlatformCline, Status: service.StatusActive}}
 			c.Set(string(middleware.ContextKeyAPIKey), key)
 			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 1, Concurrency: 1})
+			started := time.Now()
 			h.ChatCompletions(c)
 			require.Equal(t, tc.wantHits, upstream.hits, rec.Body.String())
 			require.Equal(t, tc.wantStatus, rec.Code, rec.Body.String())
@@ -204,21 +284,37 @@ func TestChatCompletionsExplicitFallback(t *testing.T) {
 					require.Contains(t, rec.Body.String(), service.OpenAIChatAttemptTimeoutCode)
 				}
 			}
-			if tc.holdFallback {
+			if tc.holdFallback && tc.timeoutSeconds > 0 {
 				require.True(t, upstream.deadlines[1].After(upstream.deadlines[0].Add(900*time.Millisecond)))
 				require.Contains(t, rec.Body.String(), service.OpenAIChatAttemptTimeoutCode)
 			}
-			if tc.stream && tc.timeoutSeconds > 0 && (tc.wantStreamError || tc.holdFallback) {
+			if tc.wantTimeoutCode != "" {
+				require.Contains(t, rec.Body.String(), tc.wantTimeoutCode)
+				if tc.wantStreamError {
+					require.Contains(t, rec.Body.String(), "event: error\ndata: ")
+				}
+			}
+			if tc.stream && (tc.timeoutSeconds > 0 || tc.wantTimeoutCode != "") && (tc.wantStreamError || tc.holdFallback) && rec.Code == 200 {
 				errors := service.GetOpsStreamErrors(c)
 				require.Len(t, errors, 1)
 				require.True(t, errors[0].CountTowardsSLA)
 				require.Equal(t, http.StatusGatewayTimeout, errors[0].IntendedStatus)
+				if tc.wantTimeoutCode != "" {
+					require.Equal(t, tc.wantTimeoutCode, errors[0].Code)
+				}
 			}
 			if tc.wantHeartbeat {
 				require.Contains(t, rec.Body.String(), ": keepalive\n\n")
 			}
 			if len(upstream.hits) == 2 && tc.holdBody {
 				require.NotContains(t, rec.Body.String(), "primary-marker")
+			}
+			if tc.wantOutput != "" {
+				require.Contains(t, rec.Body.String(), tc.wantOutput)
+			}
+			if tc.wantPromptTerminal {
+				require.True(t, strings.HasSuffix(rec.Body.String(), "data: [DONE]\n\n"), rec.Body.String())
+				require.Less(t, time.Since(started), 2*time.Second)
 			}
 		})
 	}

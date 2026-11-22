@@ -511,6 +511,16 @@ export default {
           unavailableDesc: '服务不可用 - 暂停 30 分钟'
         }
       },
+      cursorUsage: {
+        cursorModels: 'Cursor Models',
+        otherModels: 'Other Models',
+        grokBot: 'Grok Bot',
+        resetsAt: '{time} 重置',
+        loading: '正在读取 Cursor 用量',
+        unavailable: '暂时无法读取 Cursor 用量',
+        stale: '上次更新于 {time}，等待刷新',
+        unified: 'Cursor 和 Grok Bot 共用每周额度'
+      },
       usageWindow: {
         statsTitle: '5小时窗口用量统计',
         statsTitleDaily: '每日用量统计',

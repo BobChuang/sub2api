@@ -1282,6 +1282,7 @@ export interface Account {
   opencode_go_usage?: OpenCodeGoUsageState
   // Extra fields including Codex usage, OpenAI compact capability, and model-level rate limits.
   extra?: (CodexUsageSnapshot & OpenAICompactState & {
+    cursor_usage_enabled?: boolean
     model_rate_limits?: Record<string, { rate_limited_at: string; rate_limit_reset_at: string }>
     antigravity_credits_overages?: Record<string, { activated_at: string; active_until: string }>
     upstream_billing_probe_enabled?: boolean
@@ -1508,6 +1509,20 @@ export interface GrokBillingSummary {
   failed_windows?: string[]
 }
 
+export interface CursorUsageWindow {
+  utilization: number
+  resets_at?: string
+}
+
+export interface CursorUsageSnapshot {
+  cursor_models?: CursorUsageWindow
+  other_models?: CursorUsageWindow
+  grok_bot?: CursorUsageWindow
+  updated_at: string
+  stale?: boolean
+  unified?: boolean
+}
+
 export interface AccountUsageInfo {
   source?: 'passive' | 'active'
   updated_at: string | null
@@ -1539,6 +1554,7 @@ export interface AccountUsageInfo {
   grok_local_usage_7d?: WindowStats | null
   grok_local_usage_monthly?: WindowStats | null
   grok_billing?: GrokBillingSummary | null
+  cursor_usage?: CursorUsageSnapshot
   subscription_tier?: string
   subscription_tier_raw?: string
   ai_credits?: Array<{

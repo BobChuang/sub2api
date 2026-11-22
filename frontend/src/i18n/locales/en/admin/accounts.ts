@@ -1714,6 +1714,16 @@ export default {
         usageTrend: '30-Day Cost & Request Trend',
         noData: 'No usage data available for this account'
       },
+      cursorUsage: {
+        cursorModels: 'Cursor Models',
+        otherModels: 'Other Models',
+        grokBot: 'Grok Bot',
+        resetsAt: 'Resets {time}',
+        loading: 'Loading Cursor usage',
+        unavailable: 'Cursor usage unavailable',
+        stale: 'Last updated {time}. Refresh pending.',
+        unified: 'Cursor and Grok Bot share a weekly allowance.'
+      },
       usageWindow: {
         statsTitle: '5-Hour Window Usage Statistics',
         statsTitleDaily: 'Daily Usage Statistics',

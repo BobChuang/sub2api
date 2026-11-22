@@ -178,18 +178,41 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 	ccPricingCtx, pricingAt := h.gatewayService.WithOpenAIRequestPricingContext(c.Request.Context(), apiKey.GroupID)
 	c.Request = c.Request.WithContext(ccPricingCtx)
 
+	accountRoutingCtx := ccPricingCtx
+	var cancelStreamBudget context.CancelFunc
+	var writeSlotError openAISlotErrorWriter
+	routingTimedOut := func() bool {
+		if !service.ChatCompletionsStreamBudgetExpired(accountRoutingCtx) || ccPricingCtx.Err() != nil {
+			return false
+		}
+		h.handleStreamingAwareErrorWithCode(c, http.StatusGatewayTimeout, "upstream_error",
+			service.OpenAIChatRequestTimeoutCode, service.OpenAIChatRequestTimeoutMessage, streamStarted, true)
+		return true
+	}
+	if reqStream {
+		accountRoutingCtx, cancelStreamBudget = h.gatewayService.StartChatCompletionsStreamBudget(c, apiKey.ID)
+		if cancelStreamBudget != nil {
+			defer cancelStreamBudget()
+			writeSlotError = func(status int, errType, code, message string) {
+				if !routingTimedOut() {
+					h.handleStreamingAwareErrorWithCode(c, status, errType, code, message, streamStarted, false)
+				}
+			}
+		}
+	}
+
 	for {
-		if failoverClientGone(c) {
+		if failoverClientGone(c) || routingTimedOut() {
 			return
 		}
 		reqLog.Debug("openai_chat_completions.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
 		selectAccount := func() (*service.AccountSelectionResult, service.OpenAIAccountScheduleDecision, error) {
 			if fallbackPending {
 				fallbackPending, fallbackAttempted = false, true
-				return h.gatewayService.SelectChatCompletionsFallbackAccount(c.Request.Context(), apiKey.GroupID, forwardModel, fallbackAccountID, requestPlatform)
+				return h.gatewayService.SelectChatCompletionsFallbackAccount(accountRoutingCtx, apiKey.GroupID, forwardModel, fallbackAccountID, requestPlatform)
 			}
 			return h.gatewayService.SelectAccountWithSchedulerForCapability(
-				c.Request.Context(),
+				accountRoutingCtx,
 				apiKey.GroupID,
 				"",
 				sessionHash,
@@ -205,6 +228,9 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		}
 		selection, scheduleDecision, err := selectAccount()
 		if err != nil {
+			if routingTimedOut() {
+				return
+			}
 			if failoverClientGone(c) {
 				reqLog.Info("openai_chat_completions.account_select_aborted_client_disconnected", zap.Error(err))
 				return
@@ -253,7 +279,16 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 		if fallbackAttempted {
 			accountSessionHash = ""
 		}
-		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, accountSessionHash, selection, reqStream, &streamStarted, reqLog)
+		accountReleaseFunc, slotResult := func() (func(), openAISlotAcquireResult) {
+			if cancelStreamBudget != nil {
+				// Slot waiting must honor the total budget. Restore the client
+				// context before streaming so a gateway timeout can send SSE.
+				request := c.Request
+				c.Request = request.WithContext(accountRoutingCtx)
+				defer func() { c.Request = request }()
+			}
+			return h.acquireOpenAIAccountSlot(c, apiKey.GroupID, accountSessionHash, selection, reqStream, &streamStarted, reqLog, writeSlotError)
+		}()
 		if slotResult == openAISlotAcquireProfitVetoed {
 			if fallbackAttempted {
 				h.handleOpenAIProfitVetoExhausted(c, streamStarted, reqLog, profitVetoCount+1)
@@ -300,7 +335,7 @@ func (h *OpenAIGatewayHandler) ChatCompletions(c *gin.Context) {
 			responseLatencyMs = forwardDurationMs - upstreamLatencyMs
 		}
 		service.SetOpsLatencyMs(c, service.OpsResponseLatencyMsKey, responseLatencyMs)
-		if err == nil && result != nil && result.FirstTokenMs != nil {
+		if (err == nil || cancelStreamBudget != nil) && result != nil && result.FirstTokenMs != nil {
 			service.SetOpsLatencyMs(c, service.OpsTimeToFirstTokenMsKey, int64(*result.FirstTokenMs))
 		}
 		// #5148 对齐：错误返回携带的部分 result（流中断前上游已计量的 usage）照常

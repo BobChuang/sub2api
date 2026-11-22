@@ -119,6 +119,53 @@ func TestLoadChatCompletionsFallbackAccounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, map[int64]int64{9: 353}, cfg.Gateway.ChatCompletionsFallbackAccounts)
 	require.Equal(t, map[int64]int{9: 300}, cfg.Gateway.ChatCompletionsAttemptTimeoutSeconds)
+	require.Empty(t, cfg.Gateway.ChatCompletionsStreamTimeouts)
+}
+
+func TestLoadChatCompletionsStreamTimeouts(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	path := filepath.Join(t.TempDir(), "stream-timeouts.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`gateway:
+  chat_completions_attempt_timeout_seconds:
+    9: 300
+  chat_completions_stream_timeouts:
+    9:
+      first_output_timeout_seconds: 15
+      idle_timeout_seconds: 60
+      total_timeout_seconds: 300
+`), 0o600))
+	t.Setenv("CONFIG_FILE", path)
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, map[int64]int{9: 300}, cfg.Gateway.ChatCompletionsAttemptTimeoutSeconds)
+	require.Equal(t, map[int64]ChatCompletionsStreamTimeoutConfig{
+		9: {FirstOutputTimeoutSeconds: 15, IdleTimeoutSeconds: 60, TotalTimeoutSeconds: 300},
+	}, cfg.Gateway.ChatCompletionsStreamTimeouts)
+}
+
+func TestValidateChatCompletionsStreamTimeouts(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+
+	for _, tt := range []struct {
+		name     string
+		keyID    int64
+		timeouts ChatCompletionsStreamTimeoutConfig
+		want     string
+	}{
+		{"invalid API key", 0, ChatCompletionsStreamTimeoutConfig{15, 60, 300}, "requires a positive API key ID"},
+		{"missing first output timeout", 9, ChatCompletionsStreamTimeoutConfig{0, 60, 300}, "timeouts must be positive"},
+		{"missing idle timeout", 9, ChatCompletionsStreamTimeoutConfig{15, 0, 300}, "timeouts must be positive"},
+		{"missing total timeout", 9, ChatCompletionsStreamTimeoutConfig{15, 60, 0}, "timeouts must be positive"},
+		{"first output at total", 9, ChatCompletionsStreamTimeoutConfig{60, 15, 60}, "must be less than total_timeout_seconds"},
+		{"idle beyond total", 9, ChatCompletionsStreamTimeoutConfig{15, 61, 60}, "must be less than total_timeout_seconds"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg.Gateway.ChatCompletionsStreamTimeouts = map[int64]ChatCompletionsStreamTimeoutConfig{tt.keyID: tt.timeouts}
+			require.ErrorContains(t, cfg.Validate(), tt.want)
+		})
+	}
 }
 
 func TestLoadDefaultModelsListReadMaxBytes(t *testing.T) {

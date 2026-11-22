@@ -1195,6 +1195,9 @@ type GatewayConfig struct {
 	// Per-key total duration of each raw Chat Completions upstream attempt.
 	// Zero/unlisted keys retain the upstream's existing timeout behavior.
 	ChatCompletionsAttemptTimeoutSeconds map[int64]int `mapstructure:"chat_completions_attempt_timeout_seconds"`
+	// Per-key timeouts for raw streaming Chat Completions. For these streams,
+	// the shared total budget replaces ChatCompletionsAttemptTimeoutSeconds.
+	ChatCompletionsStreamTimeouts map[int64]ChatCompletionsStreamTimeoutConfig `mapstructure:"chat_completions_stream_timeouts"`
 	// Gemini 账户切换最大次数（Gemini 平台单独配置，因 API 限制更严格）
 	MaxAccountSwitchesGemini int `mapstructure:"max_account_switches_gemini"`
 	// Gemini 同账号重试次数（429/5xx 等可重试错误在换号前对同一账号的重发次数，不含首次请求）
@@ -1227,6 +1230,14 @@ type GatewayConfig struct {
 	// CNProviders: 国产 OpenAI 兼容供应商（kimi/zhipu/deepseek）的余额检测配置。
 	// 仅作用于 payg（按量付费）账号：周期探测余额，低于阈值则临时停调。
 	CNProviders GatewayCNProvidersConfig `mapstructure:"cn_providers"`
+}
+
+// ChatCompletionsStreamTimeoutConfig separates per-attempt progress timers
+// from the total budget shared by the primary and fallback attempts.
+type ChatCompletionsStreamTimeoutConfig struct {
+	FirstOutputTimeoutSeconds int `mapstructure:"first_output_timeout_seconds"`
+	IdleTimeoutSeconds        int `mapstructure:"idle_timeout_seconds"`
+	TotalTimeoutSeconds       int `mapstructure:"total_timeout_seconds"`
 }
 
 // GatewayGrokConfig holds Grok-specific gateway scheduling knobs.
@@ -3495,6 +3506,20 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.GrokResponseHeaderTimeout < 0 || c.Gateway.GrokResponseHeaderTimeout > 1800 {
 		return fmt.Errorf("gateway.grok_response_header_timeout must be between 0-1800 seconds")
+	}
+	for keyID, timeout := range c.Gateway.ChatCompletionsStreamTimeouts {
+		if keyID <= 0 {
+			return fmt.Errorf("gateway.chat_completions_stream_timeouts requires a positive API key ID, got %d", keyID)
+		}
+		if timeout.FirstOutputTimeoutSeconds <= 0 || timeout.IdleTimeoutSeconds <= 0 || timeout.TotalTimeoutSeconds <= 0 {
+			return fmt.Errorf("gateway.chat_completions_stream_timeouts.%d timeouts must be positive", keyID)
+		}
+		if timeout.FirstOutputTimeoutSeconds >= timeout.TotalTimeoutSeconds || timeout.IdleTimeoutSeconds >= timeout.TotalTimeoutSeconds {
+			return fmt.Errorf("gateway.chat_completions_stream_timeouts.%d first_output_timeout_seconds and idle_timeout_seconds must be less than total_timeout_seconds", keyID)
+		}
+		if int64(timeout.TotalTimeoutSeconds) > math.MaxInt64/int64(time.Second) {
+			return fmt.Errorf("gateway.chat_completions_stream_timeouts.%d total_timeout_seconds exceeds the supported duration", keyID)
+		}
 	}
 	if c.Gateway.MaxSameAccountRetriesGemini < 0 || c.Gateway.MaxSameAccountRetriesGemini > 10 {
 		return fmt.Errorf("gateway.max_same_account_retries_gemini must be between 0-10")

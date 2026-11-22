@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -11,20 +12,32 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const OpenAIChatAttemptTimeoutCode = "upstream_attempt_timeout"
+const (
+	OpenAIChatAttemptTimeoutCode     = "upstream_attempt_timeout"
+	OpenAIChatFirstOutputTimeoutCode = "upstream_first_output_timeout"
+	OpenAIChatStreamIdleTimeoutCode  = "upstream_stream_idle_timeout"
+	OpenAIChatRequestTimeoutCode     = "upstream_request_timeout"
+	OpenAIChatRequestTimeoutMessage  = "Upstream request exceeded its total time limit"
+)
 
 var errOpenAIChatAttemptTimeout = errors.New("upstream Chat Completions attempt exceeded its time limit")
 
 type chatAttemptTimeoutKey struct{}
 
 type chatAttemptTimeout struct {
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
+	activity *chatStreamActivityTimeout
 }
 
-func (s *OpenAIGatewayService) newChatAttemptTimeout(ctx context.Context, c *gin.Context) *chatAttemptTimeout {
+func (s *OpenAIGatewayService) newChatAttemptTimeout(ctx context.Context, c *gin.Context, stream bool) *chatAttemptTimeout {
 	if s == nil || s.cfg == nil {
 		return nil
+	}
+	if stream && c != nil {
+		if value, ok := c.Get(chatStreamBudgetKey); ok {
+			return value.(chatStreamBudget).newAttempt(ctx)
+		}
 	}
 	seconds := s.cfg.Gateway.ChatCompletionsAttemptTimeoutSeconds[getAPIKeyIDFromContext(c)]
 	if seconds <= 0 {
@@ -46,13 +59,17 @@ func chatAttemptTimeoutFromContext(ctx context.Context) *chatAttemptTimeout {
 	return attempt
 }
 
-func (a *chatAttemptTimeout) expired(c *gin.Context) bool {
-	if a == nil || !errors.Is(context.Cause(a.ctx), errOpenAIChatAttemptTimeout) {
-		return false
+func (a *chatAttemptTimeout) timeoutCause(c *gin.Context) error {
+	if a == nil || (c != nil && c.Request != nil && c.Request.Context().Err() != nil) {
+		return nil
 	}
-	// Client cancellation still wins over replay, including a simultaneous
-	// client deadline and upstream attempt timeout.
-	return c == nil || c.Request == nil || c.Request.Context().Err() == nil
+	cause := context.Cause(a.ctx)
+	switch cause {
+	case errOpenAIChatAttemptTimeout, errOpenAIChatFirstOutputTimeout, errOpenAIChatStreamIdleTimeout, errOpenAIChatRequestTimeout:
+		return cause
+	default:
+		return nil
+	}
 }
 
 // Reuse the synchronized SSE heartbeat writer while waiting for an answer.
@@ -75,23 +92,29 @@ func startChatAttemptKeepalive(c *gin.Context, interval time.Duration) func() {
 	}
 }
 
-func newChatAttemptTimeoutError(c *gin.Context, account *Account, requestID string, outputStarted bool) error {
+func newChatAttemptTimeoutError(c *gin.Context, account *Account, requestID string, outputStarted bool, cause error) error {
 	kind := "failover"
-	if outputStarted {
+	if outputStarted || cause == errOpenAIChatRequestTimeout {
 		kind = "http_error"
 	}
 	appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 		Platform: account.Platform, AccountID: account.ID, AccountName: account.Name,
+		ProxyID: opsUpstreamProxyID(account), ProxyName: opsUpstreamProxyName(account),
 		UpstreamStatusCode: http.StatusGatewayTimeout, UpstreamRequestID: requestID,
-		Kind: kind, Message: errOpenAIChatAttemptTimeout.Error(),
+		Kind: kind, Message: cause.Error(),
 	})
 	if outputStarted {
-		return newOpenAIUpstreamStreamReadError(errOpenAIChatAttemptTimeout)
+		return newOpenAIUpstreamStreamReadError(cause)
 	}
-	return &UpstreamFailoverError{
-		StatusCode:   http.StatusGatewayTimeout,
-		ResponseBody: []byte(`{"error":{"type":"upstream_error","code":"upstream_attempt_timeout","message":"Upstream request exceeded its time limit"}}`),
+	code, message := classifyOpenAIUpstreamStreamReadError(cause)
+	body, _ := json.Marshal(map[string]map[string]string{
+		"error": {"type": "upstream_error", "code": code, "message": message},
+	})
+	failoverErr := &UpstreamFailoverError{StatusCode: http.StatusGatewayTimeout, ResponseBody: body}
+	if cause == errOpenAIChatRequestTimeout {
+		failoverErr.NextAccountAction = NextAccountStop
 	}
+	return failoverErr
 }
 
 // Hold empty role chunks and heartbeats until the upstream produces actual

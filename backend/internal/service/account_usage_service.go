@@ -211,6 +211,8 @@ type UsageInfo struct {
 	GeminiProMinute    *UsageProgress `json:"gemini_pro_minute,omitempty"`    // Gemini Pro RPM
 	GeminiFlashMinute  *UsageProgress `json:"gemini_flash_minute,omitempty"`  // Gemini Flash RPM
 
+	CursorUsage *CursorUsageSnapshot `json:"cursor_usage,omitempty"`
+
 	// Antigravity 多模型配额
 	AntigravityQuota map[string]*AntigravityModelQuota `json:"antigravity_quota,omitempty"`
 	// Antigravity per-group 5-hour and weekly windows (retrieveUserQuotaSummary). Within a group
@@ -330,6 +332,7 @@ type AccountUsageService struct {
 	grokQuotaFetcher        *GrokQuotaFetcher
 	grokQuotaService        *GrokQuotaService
 	openAIQuotaService      *OpenAIQuotaService
+	cursorUsageFetcher      func(context.Context, *Account, bool) (*CursorUsageSnapshot, error)
 	cache                   *UsageCache
 	identityCache           IdentityCache
 	tlsFPProfileService     *TLSFingerprintProfileService
@@ -391,6 +394,17 @@ func (s *AccountUsageService) getUsageForAccount(ctx context.Context, account *A
 	// passive snapshot that the account table loads on mount.
 	if account.IsSyntheticUITest() && account.IsAnthropicOAuthOrSetupToken() {
 		return s.getPassiveUsageForAccount(ctx, account)
+	}
+
+	if cursorUsageEnabled(account) {
+		if s.cursorUsageFetcher == nil {
+			return nil, errCursorUsageUnavailable
+		}
+		usage, err := s.cursorUsageFetcher(ctx, account, forceProbe)
+		if err != nil {
+			return nil, err
+		}
+		return &UsageInfo{Source: "active", UpdatedAt: &usage.UpdatedAt, CursorUsage: usage}, nil
 	}
 
 	if account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth {
@@ -520,14 +534,14 @@ func (s *AccountUsageService) getUsageForAccount(ctx context.Context, account *A
 		return usage, nil
 	}
 
-	// API Key账号不支持usage查询
+	// 普通 API Key 账号不支持远端 usage 查询。
 	return nil, fmt.Errorf("account type %s does not support usage query", account.Type)
 }
 
 // GetUsage 获取账号使用量
 // OAuth账号: 调用Anthropic API获取真实数据（需要profile scope），API响应缓存10分钟，窗口统计缓存1分钟
 // Setup Token账号: 返回响应头采样的5h/7d窗口；无5h采样时回退到session_window估算
-// API Key账号: 不支持usage查询
+// API Key账号: 仅启用上游额度查询的账号支持主动查询
 func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, force ...bool) (*UsageInfo, error) {
 	forceProbe := len(force) > 0 && force[0]
 

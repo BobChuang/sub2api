@@ -3698,9 +3698,9 @@ func (h *OpenAIGatewayHandler) handleFailoverExhausted(c *gin.Context, failoverE
 	// 记录原始上游状态码，以便 ops 错误日志捕获真实的上游错误
 	upstreamMsg := service.ExtractUpstreamErrorMessage(responseBody)
 	service.SetOpsUpstreamError(c, statusCode, upstreamMsg, "")
-	if statusCode == http.StatusGatewayTimeout && gjson.GetBytes(responseBody, "error.code").String() == service.OpenAIChatAttemptTimeoutCode {
+	if code := gjson.GetBytes(responseBody, "error.code").String(); statusCode == http.StatusGatewayTimeout && service.IsOpenAIChatTimeoutCode(code) {
 		h.handleStreamingAwareErrorWithCode(c, http.StatusGatewayTimeout, "upstream_error",
-			service.OpenAIChatAttemptTimeoutCode, "Upstream request exceeded its time limit", streamStarted, true)
+			code, upstreamMsg, streamStarted, true)
 		return
 	}
 
@@ -3909,7 +3909,7 @@ func (h *OpenAIGatewayHandler) ensureOpenAIStreamReadErrorResponse(c *gin.Contex
 		streamStarted = true
 	}
 	status := http.StatusBadGateway
-	if code == service.OpenAIChatAttemptTimeoutCode {
+	if service.IsOpenAIChatTimeoutCode(code) {
 		status = http.StatusGatewayTimeout
 	}
 	h.handleStreamingAwareErrorWithCode(

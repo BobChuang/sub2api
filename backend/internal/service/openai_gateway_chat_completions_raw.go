@@ -72,7 +72,8 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	defaultMappedModel string,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
-	attempt := s.newChatAttemptTimeout(ctx, c)
+	clientStream := gjson.GetBytes(body, "stream").Bool()
+	attempt := s.newChatAttemptTimeout(ctx, c, clientStream)
 	if attempt != nil {
 		defer attempt.cancel()
 		ctx = context.WithValue(ctx, chatAttemptTimeoutKey{}, attempt)
@@ -84,7 +85,6 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 		writeChatCompletionsError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return nil, fmt.Errorf("missing model in request")
 	}
-	clientStream := gjson.GetBytes(body, "stream").Bool()
 
 	// 2. Resolve model mapping (same as ForwardAsChatCompletions)
 	billingModel := resolveOpenAIForwardModel(account, originalModel, defaultMappedModel)
@@ -242,8 +242,8 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletionsWithStartTime(
 	// 7. Handle error response with failover
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
-		if attempt.expired(c) {
-			return nil, newChatAttemptTimeoutError(c, account, resp.Header.Get("x-request-id"), false)
+		if cause := attempt.timeoutCause(c); cause != nil {
+			return nil, newChatAttemptTimeoutError(c, account, resp.Header.Get("x-request-id"), false, cause)
 		}
 		if account.Platform == PlatformGrok {
 			kind := "http_error"
@@ -357,6 +357,9 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	timeoutOutputReady := attempt == nil
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var terminal openAIRawStreamTerminalState
+	var lastOutputAt time.Time
+	splitTimeout := attempt != nil && attempt.activity != nil
+	doneFrameComplete := false
 
 	writeLine := func(line string) {
 		if clientDisconnected {
@@ -401,10 +404,28 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		if splitTimeout && attempt.ctx.Err() != nil {
+			break
+		}
 		refusalDetector.ObserveSSELine(line)
 		if payload, ok := extractOpenAISSEDataLine(line); ok {
 			trimmedPayload := strings.TrimSpace(payload)
-			if !timeoutOutputReady && chatTimeoutPayloadStartsOutput(trimmedPayload) {
+			if splitTimeout && !clientOutputStarted && gjson.Get(trimmedPayload, "error").IsObject() {
+				data := []byte(trimmedPayload)
+				message := extractOpenAISSEErrorMessage(data)
+				if openAIStreamFailedEventShouldFailover(data, message) {
+					return nil, s.newOpenAIStreamFailoverErrorWithModel(c, account, false, requestID, data, message, upstreamModel, resp.Header)
+				}
+			}
+			if splitTimeout && trimmedPayload != "" && chatTimeoutPayloadStartsOutput(trimmedPayload) {
+				arrivedAt := time.Now()
+				attempt.activity.observeOutput(arrivedAt)
+				if attempt.ctx.Err() != nil {
+					break
+				}
+				lastOutputAt = arrivedAt
+				timeoutOutputReady = true
+			} else if !splitTimeout && !timeoutOutputReady && chatTimeoutPayloadStartsOutput(trimmedPayload) {
 				timeoutOutputReady = true
 			}
 			terminal.ObserveDataLine(trimmedPayload)
@@ -414,7 +435,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 				if u := extractCCStreamUsage(payload); u != nil {
 					usage = *u
 				}
-				if firstTokenMs == nil && !usageOnlyChunk {
+				if firstTokenMs == nil && !usageOnlyChunk && (!splitTimeout || timeoutOutputReady) {
 					elapsed := int(time.Since(startTime).Milliseconds())
 					firstTokenMs = &elapsed
 				}
@@ -427,6 +448,12 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 		writeLine(line)
 		// 不逐行 flush：scanner 下次向上游读取前统一 flush（见 flushBeforeUpstreamRead）。
 		flushPending = true
+		if splitTimeout && terminal.sawDone && line == "" {
+			// Forward the complete [DONE] frame without waiting for the
+			// upstream to close the connection or risking a late timeout.
+			doneFrameComplete = true
+			break
+		}
 	}
 	flushToClient()
 
@@ -450,11 +477,25 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	}
 
 	scanErr := scanner.Err()
-	if attempt.expired(c) {
-		if !clientOutputStarted {
-			return nil, newChatAttemptTimeoutError(c, account, requestID, false)
+	if cause := attempt.timeoutCause(c); cause != nil && !doneFrameComplete {
+		if splitTimeout {
+			fields := []zap.Field{
+				zap.Error(cause),
+				zap.String("upstream_request_id", requestID),
+				zap.Int64("account_id", account.ID),
+				zap.Bool("client_output_started", clientOutputStarted),
+				zap.Bool("terminal_seen", terminal.Terminated()),
+				zap.Duration("attempt_elapsed", time.Since(startTime)),
+			}
+			if !lastOutputAt.IsZero() {
+				fields = append(fields, zap.Time("last_output_at", lastOutputAt))
+			}
+			logger.L().Warn("openai chat_completions raw: configured stream timeout", fields...)
 		}
-		return resultWithUsage(), newChatAttemptTimeoutError(c, account, requestID, true)
+		if !clientOutputStarted {
+			return nil, newChatAttemptTimeoutError(c, account, requestID, false, cause)
+		}
+		return resultWithUsage(), newChatAttemptTimeoutError(c, account, requestID, true, cause)
 	}
 	if scanErr != nil && !errors.Is(scanErr, context.Canceled) && !errors.Is(scanErr, context.DeadlineExceeded) {
 		logger.L().Warn("openai chat_completions raw: stream read error",
@@ -577,8 +618,8 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	}
 
 	respBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
-	if attempt.expired(c) {
-		return nil, newChatAttemptTimeoutError(c, account, requestID, false)
+	if cause := attempt.timeoutCause(c); cause != nil {
+		return nil, newChatAttemptTimeoutError(c, account, requestID, false, cause)
 	}
 	if err != nil {
 		if !errors.Is(err, ErrUpstreamResponseBodyTooLarge) {

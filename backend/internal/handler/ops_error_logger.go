@@ -2073,6 +2073,8 @@ func inferStreamFailureStatus(_ *gin.Context, parsed parsedOpsError) int {
 		return http.StatusServiceUnavailable
 	case "authentication_failed":
 		return http.StatusUnauthorized
+	case service.OpenAIChatFirstOutputTimeoutCode, service.OpenAIChatStreamIdleTimeoutCode, service.OpenAIChatRequestTimeoutCode:
+		return http.StatusGatewayTimeout
 	}
 
 	switch strings.TrimSpace(parsed.ErrorType) {

@@ -49,7 +49,7 @@
       </div>
 
       <!-- Percentage -->
-      <span :class="['w-[32px] shrink-0 text-right text-[10px] font-medium', textClass]">
+      <span :class="[detailed ? 'min-w-[34px]' : 'w-[32px]', 'shrink-0 text-right text-[10px] font-medium', textClass]">
         {{ displayPercent }}
       </span>
 
@@ -79,6 +79,7 @@ const props = withDefaults(
     estimatedTotalCost?: number | null
     showNowWhenIdle?: boolean
     remainingCapacity?: boolean
+    detailed?: boolean
     /** fixed: 定宽居中徽章（账号页纵向对齐）；auto: 限宽截断左对齐（监控页组合标签） */
     labelWidth?: 'fixed' | 'auto'
   }>(),
@@ -129,9 +130,11 @@ const labelClass = computed(() => {
 // Label badge width mode: fixed 定宽保证账号页纵向对齐；auto 限宽截断适配
 // 监控页「Pro/7 天」类组合标签。百分比列在两种模式下保持不变。
 const labelSizeClass = computed(() =>
-  props.labelWidth === 'auto'
-    ? 'max-w-[72px] shrink-0 truncate rounded px-1 text-left text-[10px] font-medium'
-    : 'w-[32px] shrink-0 rounded px-1 text-center text-[10px] font-medium'
+  props.detailed
+    ? 'w-[76px] shrink-0 whitespace-nowrap rounded px-1 text-left text-[10px] font-medium'
+    : props.labelWidth === 'auto'
+      ? 'max-w-[72px] shrink-0 truncate rounded px-1 text-left text-[10px] font-medium'
+      : 'w-[32px] shrink-0 rounded px-1 text-center text-[10px] font-medium'
 )
 
 // Progress bar color based on utilization
@@ -181,11 +184,11 @@ const barWidth = computed(() => {
 // Display percentage (cap at 999% for readability)
 const displayPercent = computed(() => {
   if (props.utilizationUnknown) return '—'
-  const percent = Math.round(
-    props.remainingCapacity
-      ? Math.min(Math.max(props.utilization, 0), 100)
-      : props.utilization
-  )
+  const utilization = props.remainingCapacity
+    ? Math.min(Math.max(props.utilization, 0), 100)
+    : props.utilization
+  if (props.detailed && utilization > 0 && utilization < 0.01) return '<0.01%'
+  const percent = props.detailed ? Number(utilization.toFixed(2)) : Math.round(utilization)
   return percent > 999 ? '>999%' : `${percent}%`
 })
 

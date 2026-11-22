@@ -687,8 +687,13 @@
     <AccountQuotaInfo v-if="account.platform === 'gemini' && !isGeminiThirdPartyApiKey" :account="account" />
     <!-- Key/Bedrock accounts: show today stats + optional quota bars -->
     <div v-else class="space-y-1">
+      <CursorUsageCell
+        v-if="showCursorUsage"
+        :key="account.id"
+        :account-id="account.id"
+      />
       <OllamaCloudUsageCell
-        v-if="account.ollama_cloud_usage?.eligible"
+        v-else-if="account.ollama_cloud_usage?.eligible"
         :account="account"
         @updated="handleOllamaCloudUsageUpdated"
       />
@@ -757,7 +762,7 @@
 
       <!-- No data at all -->
       <div
-        v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota && !account.ollama_cloud_usage?.eligible && !account.opencode_go_usage?.eligible"
+        v-if="!showCursorUsage && !todayStats && !todayStatsLoading && !hasApiKeyQuota && !account.ollama_cloud_usage?.eligible && !account.opencode_go_usage?.eligible"
         class="text-xs text-gray-400"
       >-</div>
     </div>
@@ -788,6 +793,7 @@ import {
   isMultiProtocolApiKeyPlatform
 } from './credentialsBuilder'
 import OpenCodeGoUsageCell from './OpenCodeGoUsageCell.vue'
+import CursorUsageCell from './CursorUsageCell.vue'
 
 // Module-level cache shared across all AccountUsageCell instances
 const _usageCache = new Map<number, { data: AccountUsageInfo; ts: number }>()
@@ -822,6 +828,11 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const desktopViewportQuery = '(min-width: 768px)'
+const showCursorUsage = computed(() =>
+  props.account.platform === 'openai' &&
+  props.account.type === 'apikey' &&
+  props.account.extra?.cursor_usage_enabled === true
+)
 
 const unmounted = ref(false)
 onBeforeUnmount(() => { unmounted.value = true })

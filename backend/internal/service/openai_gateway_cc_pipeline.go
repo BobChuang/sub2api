@@ -273,8 +273,8 @@ func (s *OpenAIGatewayService) sendCCUpstreamRequest(
 	}
 	resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 	if err != nil {
-		if attempt := chatAttemptTimeoutFromContext(ctx); attempt.expired(c) {
-			return nil, newChatAttemptTimeoutError(c, account, "", false)
+		if cause := chatAttemptTimeoutFromContext(ctx).timeoutCause(c); cause != nil {
+			return nil, newChatAttemptTimeoutError(c, account, "", false, cause)
 		}
 		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 	}
